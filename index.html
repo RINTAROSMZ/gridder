@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Gridder — 歩幅引き込み AR</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: -apple-system, sans-serif;
+      color: #fff;
+    }
+
+    #canvas-container canvas {
+      position: fixed;
+      inset: 0;
+      width: 100% !important;
+      height: 100% !important;
+      /* AR 中に誤タップで Safari の UI が開かないようにスクロールを無効化 */
+      touch-action: none;
+    }
+
+    /* ── AR 開始ボタン ───────────────────────────────── */
+    #btn-start {
+      position: fixed;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 16px 40px;
+      font-size: 18px;
+      font-weight: 600;
+      background: #fff;
+      color: #000;
+      border: none;
+      border-radius: 50px;
+      cursor: pointer;
+      z-index: 10;
+    }
+
+    /* ── コントロールパネル ──────────────────────────── */
+    #ui {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      display: none;           /* AR 開始後に表示 */
+      flex-direction: column;
+      gap: 10px;
+      padding: 16px 20px 32px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      z-index: 10;
+    }
+
+    #ui.visible { display: flex; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .row label {
+      flex: 0 0 80px;
+      font-size: 13px;
+      opacity: 0.8;
+    }
+
+    .row span {
+      flex: 0 0 54px;
+      font-size: 13px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    input[type="range"] {
+      flex: 1;
+      height: 4px;
+      accent-color: #00ff88;
+    }
+
+    input[type="color"] {
+      flex: 1;
+      height: 36px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      background: none;
+    }
+
+    .toggle-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* iOS スタイルトグル */
+    .toggle-wrap input[type="checkbox"] {
+      width: 44px;
+      height: 26px;
+      appearance: none;
+      background: #555;
+      border-radius: 13px;
+      position: relative;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle-wrap input[type="checkbox"]:checked { background: #00ff88; }
+    .toggle-wrap input[type="checkbox"]::after {
+      content: "";
+      position: absolute;
+      width: 22px;
+      height: 22px;
+      background: #fff;
+      border-radius: 50%;
+      top: 2px;
+      left: 2px;
+      transition: left 0.2s;
+    }
+    .toggle-wrap input[type="checkbox"]:checked::after { left: 20px; }
+
+    #status {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 12px;
+      opacity: 0.6;
+      z-index: 10;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+
+    #https-warn {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      padding: 10px;
+      background: #c0392b;
+      font-size: 13px;
+      text-align: center;
+      z-index: 20;
+    }
+  </style>
+</head>
+<body>
+
+<div id="https-warn">
+  ⚠️ WebXR AR には HTTPS が必要です。<code>task serve:tunnel</code> で ngrok を起動してください。
+</div>
+<div id="canvas-container"></div>
+<p id="status">待機中</p>
+
+<button id="btn-start">AR を開始</button>
+
+<div id="ui">
+  <!-- 歩幅スライダー -->
+  <div class="row">
+    <label>歩幅</label>
+    <input id="slider-spacing" type="range"
+           min="0.30" max="2.00" step="0.05" value="0.60" />
+    <span id="label-spacing">0.60 m</span>
+  </div>
+
+  <!-- 平滑化スライダー (Kalman α) -->
+  <div class="row">
+    <label>平滑化</label>
+    <input id="slider-smoothing" type="range"
+           min="0.00" max="1.00" step="0.01" value="0.15" />
+    <span id="label-smoothing">0.15</span>
+  </div>
+
+  <!-- グリッド色 -->
+  <div class="row">
+    <label>グリッド色</label>
+    <input id="color-picker" type="color" value="#00ff88" />
+  </div>
+
+  <!-- グリッド表示トグル -->
+  <div class="row">
+    <label>グリッド</label>
+    <div class="toggle-wrap">
+      <input id="toggle-grid" type="checkbox" checked />
+      <span id="label-toggle">表示</span>
+    </div>
+  </div>
+</div>
+
+<!--
+  dist/core.js: Emscripten ビルド出力
+    emcc src/wrapper.cpp -O3 -s WASM=1 -s WITH_PYTHON=1
+         -s EXPORTED_FUNCTIONS='["_grid_init","_grid_update_plane",
+                                  "_grid_build_vertices","_grid_set_smoothing",
+                                  "_grid_destroy"]'
+         --preload-file internal
+         -o dist/core.js
+  ビルド前は dist/core.js が存在しないため app.js 側でフォールバック処理を行う。
+-->
+<script src="dist/core.js" onerror="window.__wasmLoadFailed=true"></script>
+
+<!--
+  Three.js r158 — WebXR + WebGL2 対応版
+  importmap を使わず UMD を window.THREE に展開して
+  app.js (通常 script) から参照させる。
+-->
+<script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+
+<script src="dist/app.js"></script>
+
+</body>
+</html>

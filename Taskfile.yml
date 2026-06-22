@@ -1,0 +1,109 @@
+version: '3'
+
+vars:
+  # Emscripten エクスポート関数リスト
+  EXPORTED_FNS: >-
+    ["_grid_init","_grid_update_plane","_grid_build_vertices",
+     "_grid_set_smoothing","_grid_destroy","_malloc","_free"]
+
+tasks:
+
+  # ── Wasm ビルド ──────────────────────────────────────────────────────────
+  wasm:build:
+    desc: "Emscripten で Wasm をビルドして dist/core.js を生成"
+    cmds:
+      - |
+        emcc src/wrapper.cpp \
+          -O3 \
+          -s WASM=1 \
+          -s WITH_PYTHON=1 \
+          -s EXPORTED_FUNCTIONS='{{.EXPORTED_FNS}}' \
+          -s EXPORTED_RUNTIME_METHODS='["cwrap","HEAPF32"]' \
+          -s ALLOW_MEMORY_GROWTH=1 \
+          --preload-file internal \
+          -o dist/core.js
+    # 注意: -s WITH_PYTHON=1 は環境に応じて調整が必要。
+    #   CPython-Wasm ビルド済み環境では以下のように置き換える:
+    #   emcc src/wrapper.cpp $(python3-config --includes) \
+    #        -L$(python3-config --prefix)/lib -lpython3.x \
+    #        --embed-file internal -o dist/core.js
+
+  wasm:clean:
+    desc: "Emscripten 生成物を削除"
+    cmds:
+      - rm -f dist/core.js dist/core.wasm dist/core.data
+
+  # ── ローカル開発サーバー ─────────────────────────────────────────────────
+  serve:
+    desc: "ローカル開発サーバーを起動 (http://localhost:8000)"
+    cmds:
+      - python3 -m http.server 8000 --directory .
+
+  # iOS 実機テスト: WebXR AR は HTTPS 必須
+  # 手順:
+  #   ターミナル①: task serve
+  #   ターミナル②: task serve:tunnel
+  #   iPhone Safari で表示された https://*.ngrok-free.app を開く
+  serve:tunnel:
+    desc: "ngrok で HTTPS トンネルを起動 (iOS 実機テスト用)"
+    cmds:
+      - |
+        if ! command -v ngrok &>/dev/null; then
+          echo "ngrok が見つかりません。インストールしてください:"
+          echo "  brew install ngrok/ngrok/ngrok"
+          echo "  ngrok config add-authtoken <YOUR_TOKEN>"
+          exit 1
+        fi
+        echo "iPhone Safari で以下の URL を開いてください:"
+        ngrok http 8000
+
+  # ── GitHub Pages デプロイ ─────────────────────────────────────────────────
+  deploy:
+    desc: "GitHub Pages にプッシュ (main ブランチのルートをそのまま公開)"
+    cmds:
+      - |
+        if [ -z "$(git remote get-url origin 2>/dev/null)" ]; then
+          echo "リモートリポジトリが設定されていません。"
+          echo "  git remote add origin https://github.com/<user>/gridder.git"
+          exit 1
+        fi
+        git add dist/app.js index.html internal/ src/
+        git commit -m "deploy: update app" || true
+        git push origin main
+      - echo "GitHub Pages URL: https://<user>.github.io/gridder/"
+      - echo "Settings > Pages > Source: main ブランチ / (root) を確認してください"
+
+  # ── テスト ──────────────────────────────────────────────────────────────
+  test:
+    desc: "Python コアのユニットテストを実行"
+    cmds:
+      - python3 -m pytest tests/ -v --tb=short
+
+  test:watch:
+    desc: "ファイル変更を監視してテストを自動再実行"
+    cmds:
+      - python3 -m pytest tests/ -v --tb=short -f
+
+  # ── コード整形 ───────────────────────────────────────────────────────────
+  format:
+    desc: "Python (black) と C++ (clang-format) を整形"
+    cmds:
+      - black internal/ tests/
+      - clang-format -i src/*.cpp src/*.hpp
+
+  format:check:
+    desc: "整形差分チェック (CI 用)"
+    cmds:
+      - black --check internal/ tests/
+      - clang-format --dry-run --Werror src/*.cpp src/*.hpp
+
+  # ── 依存インストール ──────────────────────────────────────────────────────
+  deps:
+    desc: "Python 依存パッケージをインストール"
+    cmds:
+      - pip3 install numpy black pytest pytest-watch
+
+  # ── デフォルト ────────────────────────────────────────────────────────────
+  default:
+    cmds:
+      - task --list

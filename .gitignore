@@ -1,0 +1,20 @@
+# Emscripten 生成物 (emcc が dist/ に出力する)
+dist/core.js
+dist/core.wasm
+dist/core.data
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# エディタ
+.vscode/settings.json
+*.swp
+*.swo
