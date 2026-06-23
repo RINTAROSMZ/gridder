@@ -14,22 +14,43 @@
       color: #fff;
     }
 
-    #canvas-container canvas {
+    /* ── レイヤー構成 (z-index) ─────────────────────────────
+       0: #cam-feed  カメラ映像
+       1: Three.js canvas (透明背景でグリッドのみ描画)
+      10: UI パネル・ボタン
+    ────────────────────────────────────────────────────── */
+
+    /* カメラ映像: 最背面 */
+    #cam-feed {
+      display: none;          /* start() 後に block に切り替え */
       position: fixed;
       inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;      /* アスペクト比を保ちつつ全画面 */
+      z-index: 0;
+      background: #000;
+    }
+
+    /* Three.js canvas: 映像の上・UI の下 */
+    #canvas-container {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+    }
+    #canvas-container canvas {
       width: 100% !important;
       height: 100% !important;
-      /* AR 中に誤タップで Safari の UI が開かないようにスクロールを無効化 */
-      touch-action: none;
+      touch-action: none;     /* AR 中の誤スクロール防止 */
     }
 
     /* ── AR 開始ボタン ───────────────────────────────── */
     #btn-start {
       position: fixed;
-      bottom: 40px;
+      bottom: 48px;
       left: 50%;
       transform: translateX(-50%);
-      padding: 16px 40px;
+      padding: 16px 44px;
       font-size: 18px;
       font-weight: 600;
       background: #fff;
@@ -38,7 +59,9 @@
       border-radius: 50px;
       cursor: pointer;
       z-index: 10;
+      -webkit-tap-highlight-color: transparent;
     }
+    #btn-start:active { opacity: 0.8; }
 
     /* ── コントロールパネル ──────────────────────────── */
     #ui {
@@ -46,16 +69,15 @@
       bottom: 0;
       left: 0;
       right: 0;
-      display: none;           /* AR 開始後に表示 */
+      display: none;
       flex-direction: column;
       gap: 10px;
-      padding: 16px 20px 32px;
+      padding: 16px 20px 36px;
       background: rgba(0, 0, 0, 0.55);
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
       z-index: 10;
     }
-
     #ui.visible { display: flex; }
 
     .row {
@@ -63,13 +85,11 @@
       align-items: center;
       gap: 12px;
     }
-
     .row label {
       flex: 0 0 80px;
       font-size: 13px;
       opacity: 0.8;
     }
-
     .row span {
       flex: 0 0 54px;
       font-size: 13px;
@@ -82,7 +102,6 @@
       height: 4px;
       accent-color: #00ff88;
     }
-
     input[type="color"] {
       flex: 1;
       height: 36px;
@@ -92,16 +111,10 @@
       background: none;
     }
 
-    .toggle-wrap {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
     /* iOS スタイルトグル */
+    .toggle-wrap { display: flex; align-items: center; gap: 10px; }
     .toggle-wrap input[type="checkbox"] {
-      width: 44px;
-      height: 26px;
+      width: 44px; height: 26px;
       appearance: none;
       background: #555;
       border-radius: 13px;
@@ -113,49 +126,39 @@
     .toggle-wrap input[type="checkbox"]::after {
       content: "";
       position: absolute;
-      width: 22px;
-      height: 22px;
+      width: 22px; height: 22px;
       background: #fff;
       border-radius: 50%;
-      top: 2px;
-      left: 2px;
+      top: 2px; left: 2px;
       transition: left 0.2s;
     }
     .toggle-wrap input[type="checkbox"]:checked::after { left: 20px; }
 
+    /* ── ステータス表示 ───────────────────────────────── */
     #status {
       position: fixed;
       top: 20px;
       left: 50%;
       transform: translateX(-50%);
       font-size: 12px;
-      opacity: 0.6;
+      opacity: 0.7;
       z-index: 10;
       pointer-events: none;
       white-space: nowrap;
-    }
-
-    #https-warn {
-      display: none;
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      padding: 10px;
-      background: #c0392b;
-      font-size: 13px;
-      text-align: center;
-      z-index: 20;
+      text-shadow: 0 1px 3px rgba(0,0,0,0.8);
     }
   </style>
 </head>
 <body>
 
-<div id="https-warn">
-  ⚠️ WebXR AR には HTTPS が必要です。<code>task serve:tunnel</code> で ngrok を起動してください。
-</div>
-<div id="canvas-container"></div>
-<p id="status">待機中</p>
+<!-- カメラ映像 (getUserMedia → srcObject) -->
+<video id="cam-feed" autoplay playsinline muted></video>
 
-<button id="btn-start">AR を開始</button>
+<!-- Three.js レンダリング先 -->
+<div id="canvas-container"></div>
+
+<p id="status"></p>
+<button id="btn-start">カメラを起動</button>
 
 <div id="ui">
   <!-- 歩幅スライダー -->
@@ -166,7 +169,7 @@
     <span id="label-spacing">0.60 m</span>
   </div>
 
-  <!-- 平滑化スライダー (Kalman α) -->
+  <!-- 平滑化スライダー -->
   <div class="row">
     <label>平滑化</label>
     <input id="slider-smoothing" type="range"
@@ -190,25 +193,8 @@
   </div>
 </div>
 
-<!--
-  dist/core.js: Emscripten ビルド出力
-    emcc src/wrapper.cpp -O3 -s WASM=1 -s WITH_PYTHON=1
-         -s EXPORTED_FUNCTIONS='["_grid_init","_grid_update_plane",
-                                  "_grid_build_vertices","_grid_set_smoothing",
-                                  "_grid_destroy"]'
-         --preload-file internal
-         -o dist/core.js
-  ビルド前は dist/core.js が存在しないため app.js 側でフォールバック処理を行う。
--->
-<script src="dist/core.js" onerror="window.__wasmLoadFailed=true"></script>
-
-<!--
-  Three.js r158 — WebXR + WebGL2 対応版
-  importmap を使わず UMD を window.THREE に展開して
-  app.js (通常 script) から参照させる。
--->
+<!-- Three.js r158 UMD -->
 <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
-
 <script src="dist/app.js"></script>
 
 </body>
