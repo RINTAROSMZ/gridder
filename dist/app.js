@@ -1,63 +1,78 @@
 /**
- * app.js — カメラ + DeviceOrientation ベースの AR グリッド描画
+ * app.js
  *
- * WebXR を廃止し、全 iOS ブラウザ (Safari / Chrome 両方) で動作する
- * getUserMedia + DeviceOrientationEvent に切り替え。
+ * 座標系: local-floor (y=0 = 床面) を世界座標として扱う。
+ * グリッドは y=0 の水平平面に固定された THREE.Mesh であり、
+ * カメラがどこへ移動してもグリッドは地面に張り付いたまま。
  *
- * フレームごとの処理:
- *   DeviceOrientationEvent (beta/gamma)
- *     → Kalman1D フィルタ (JS 実装)
- *     → Three.js カメラ回転を更新
- *     → fallbackBuildVertices() でグリッド頂点生成
- *     → BufferGeometry 更新 → renderer.render()
+ * グリッドの描画はフラグメントシェーダーで vWorldPos.xz を使って
+ * 世界座標上に格子を引くため、頂点バッファの再生成は一切不要。
+ * 大きな PlaneGeometry をカメラ直下に追従させるだけでよい。
+ *
+ * Primary:  WebXR immersive-ar (local-floor) → ARKit 6DOF カメラポーズ
+ * Fallback: getUserMedia + DeviceOrientation → 3DOF (回転のみ、並進なし)
  */
 
-/* ── 定数 ─────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   §1  グリッドシェーダー
+   ═══════════════════════════════════════════════════════════ */
 
-const MAX_FLOATS      = 12_000;
-const DEFAULT_SPACING = 0.60;   // 初期グリッド間隔 [m]
-const DEFAULT_EXTENT  = 2.50;   // グリッド半幅 [m]
-const EYE_HEIGHT      = 1.60;   // 仮定カメラ高さ [m]
-const CAM_FOV         = 60;     // iPhone リアカメラの垂直 FOV 近似値 [deg]
-
-/* ── JS Kalman フィルタ (internal/grid_core.py の _Kalman1D に対応) ─── */
-
-class Kalman1D {
-    /**
-     * @param {number} q プロセスノイズ — 角度の変化しやすさ
-     * @param {number} r 観測ノイズ — センサー読み値のばらつき [deg]
-     */
-    constructor(q = 0.1, r = 1.0) {
-        this._q = q;  this._r = r;
-        this._x = 0;  this._p = 1;  this._ready = false;
-    }
-    update(z) {
-        if (!this._ready) { this._x = z; this._ready = true; return z; }
-        const pPred = this._p + this._q;
-        const k     = pPred / (pPred + this._r);
-        this._x    += k * (z - this._x);
-        this._p     = (1 - k) * pPred;
-        return this._x;
-    }
+const GRID_VERT = /* glsl */`
+varying vec3 vWorldPos;
+void main() {
+    // ワールド座標を varying に渡す (modelMatrix = mesh の World Transform)
+    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+    vWorldPos = worldPos.xyz;
+    gl_Position = projectionMatrix * viewMatrix * worldPos;
 }
+`;
 
-// beta (前後傾き 0-180°) と gamma (左右傾き -90〜90°) を個別にフィルタ
-const kBeta  = new Kalman1D(0.1, 1.0);
-const kGamma = new Kalman1D(0.1, 1.0);
-let filteredBeta  = 60;   // 初期値: カメラが約 30° 下向き
-let filteredGamma = 0;
+const GRID_FRAG = /* glsl */`
+#extension GL_OES_standard_derivatives : enable
+precision highp float;
 
-/* ── Three.js セットアップ ────────────────────────────────────────────── */
+uniform float uSpacing;   // グリッド間隔 [m]
+uniform vec3  uColor;
+uniform float uOpacity;
+
+varying vec3 vWorldPos;
+
+void main() {
+    // ワールド XZ 座標を spacing で割り、格子パターンを計算
+    // fwidth() による自動アンチエイリアシング（距離に応じた線幅）
+    vec2 coord = vWorldPos.xz / uSpacing;
+    vec2 grid  = abs(fract(coord - 0.5) - 0.5) / fwidth(coord);
+    float line  = min(grid.x, grid.y);
+    float alpha = (1.0 - clamp(line, 0.0, 1.0)) * uOpacity;
+    if (alpha < 0.005) discard;
+    gl_FragColor = vec4(uColor, alpha);
+}
+`;
+
+/* ═══════════════════════════════════════════════════════════
+   §2  定数
+   ═══════════════════════════════════════════════════════════ */
+
+const DEFAULT_SPACING = 0.60;   // [m] 模擬歩幅
+const PLANE_SIZE      = 200;    // [m] 床面メッシュサイズ (常にカメラ直下をカバー)
+const FALLBACK_EYE_H  = 1.40;  // [m] DeviceOrientation 時のカメラ高さ
+
+/* ═══════════════════════════════════════════════════════════
+   §3  Three.js セットアップ
+   ═══════════════════════════════════════════════════════════ */
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setClearColor(0x000000, 0);   // 背景を透明にしてビデオを透過
+renderer.setClearColor(0x000000, 0);
+renderer.xr.enabled = true;   // WebXR 対応 (非 XR セッション時も通常描画可)
 document.getElementById('canvas-container').appendChild(renderer.domElement);
 
 const scene  = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(CAM_FOV,
-    window.innerWidth / window.innerHeight, 0.01, 20);
+const camera = new THREE.PerspectiveCamera(
+    60, window.innerWidth / window.innerHeight, 0.01, 200
+);
+camera.position.set(0, FALLBACK_EYE_H, 0);
 
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -65,178 +80,215 @@ window.addEventListener('resize', () => {
     renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-/* ── グリッドジオメトリ ───────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   §4  ワールド座標グリッドメッシュ
+   ═══════════════════════════════════════════════════════════ */
 
-const gridPositions = new Float32Array(MAX_FLOATS);
-const posAttr       = new THREE.BufferAttribute(gridPositions, 3);
-posAttr.setUsage(THREE.DynamicDrawUsage);
+const gridUniforms = {
+    uSpacing: { value: DEFAULT_SPACING },
+    uColor:   { value: new THREE.Color(0x00ff88) },
+    uOpacity: { value: 0.9 },
+};
 
-const gridGeo  = new THREE.BufferGeometry();
-gridGeo.setAttribute('position', posAttr);
-gridGeo.setDrawRange(0, 0);
+const gridMat = new THREE.ShaderMaterial({
+    uniforms:       gridUniforms,
+    vertexShader:   GRID_VERT,
+    fragmentShader: GRID_FRAG,
+    transparent:    true,
+    side:           THREE.DoubleSide,
+    depthWrite:     false,
+    extensions:     { derivatives: true },  // WebGL1 で fwidth を有効化
+});
 
-const gridMat  = new THREE.LineBasicMaterial({ color: 0x00ff88 });
-const gridMesh = new THREE.LineSegments(gridGeo, gridMat);
+// PlaneGeometry はデフォルトで XY 平面 → -90° 回転して XZ 水平床
+const gridMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE, 1, 1),
+    gridMat
+);
+gridMesh.rotation.x = -Math.PI / 2;
+gridMesh.position.y = 0;   // ワールド Y=0 に固定
 scene.add(gridMesh);
 
-/* ── カメラ姿勢更新 ──────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   §5  DeviceOrientation フォールバック
+   ═══════════════════════════════════════════════════════════ */
 
-function updateCamera() {
-    // カメラを目線の高さに固定
-    camera.position.set(0, EYE_HEIGHT, 0);
-    camera.rotation.order = 'YXZ';
-
-    // beta:  0° = スマホ水平(上向き) / 90° = 垂直(水平を見る) / 45° = 床を見る
-    // pitch: 正 = 上向き / 負 = 下向き
-    camera.rotation.x = -(90 - filteredBeta) * Math.PI / 180;
-
-    // gamma: 正 = 右傾き / 負 = 左傾き (符号を反転して自然な見え方に)
-    camera.rotation.z = -filteredGamma * Math.PI / 180;
-}
-
-/* ── グリッド頂点生成 (JS 純実装) ───────────────────────────────────── */
-
-const fallback = { plane: null };
-
-function fallbackBuildVertices(spacing, extentX, extentZ) {
-    if (!fallback.plane) return 0;
-    const { nx, ny, nz, d } = fallback.plane;
-    const p0 = [nx * d, ny * d, nz * d];
-
-    // 基底ベクトル (Y-up)
-    let ux, uy, uz;
-    if (Math.abs(ny) < 0.9) { ux = -nz; uy = 0;  uz = nx; }
-    else                     { ux =   0; uy = nz;  uz = -ny; }
-    const ul = Math.hypot(ux, uy, uz);
-    ux /= ul; uy /= ul; uz /= ul;
-    const vx = ny*uz - nz*uy, vy = nz*ux - nx*uz, vz = nx*uy - ny*ux;
-
-    const stepsU = Math.max(1, Math.round(extentX / spacing));
-    const stepsV = Math.max(1, Math.round(extentZ / spacing));
-    let idx = 0;
-
-    for (let i = -stepsV; i <= stepsV; i++) {
-        const t = i * spacing;
-        gridPositions[idx++] = p0[0] + t*vx - extentX*ux;
-        gridPositions[idx++] = p0[1] + t*vy - extentX*uy;
-        gridPositions[idx++] = p0[2] + t*vz - extentX*uz;
-        gridPositions[idx++] = p0[0] + t*vx + extentX*ux;
-        gridPositions[idx++] = p0[1] + t*vy + extentX*uy;
-        gridPositions[idx++] = p0[2] + t*vz + extentX*uz;
+// 1D Kalman フィルタ (python 側 _Kalman1D の JS 移植)
+class Kalman1D {
+    constructor(q, r) {
+        this.q = q; this.r = r;
+        this.x = 0; this.p = 1; this.ready = false;
     }
-    for (let i = -stepsU; i <= stepsU; i++) {
-        const t = i * spacing;
-        gridPositions[idx++] = p0[0] + t*ux - extentZ*vx;
-        gridPositions[idx++] = p0[1] + t*uy - extentZ*vy;
-        gridPositions[idx++] = p0[2] + t*uz - extentZ*vz;
-        gridPositions[idx++] = p0[0] + t*ux + extentZ*vx;
-        gridPositions[idx++] = p0[1] + t*uy + extentZ*vy;
-        gridPositions[idx++] = p0[2] + t*uz + extentZ*vz;
-    }
-    return idx;
-}
-
-function updateGridGeometry() {
-    const n = fallbackBuildVertices(uiState.spacing, DEFAULT_EXTENT, DEFAULT_EXTENT);
-    if (n > 0) {
-        posAttr.needsUpdate = true;
-        gridGeo.setDrawRange(0, n / 3);
+    update(z) {
+        if (!this.ready) { this.x = z; this.ready = true; return z; }
+        const pp = this.p + this.q;
+        const k  = pp / (pp + this.r);
+        this.x  += k * (z - this.x);
+        this.p   = (1 - k) * pp;
+        return this.x;
     }
 }
 
-/* ── メインループ ────────────────────────────────────────────────────── */
+const kAlpha = new Kalman1D(0.5, 2.0);
+const kBeta  = new Kalman1D(0.1, 1.0);
+const kGamma = new Kalman1D(0.1, 1.0);
+const devOri = { alpha: 0, beta: 60, gamma: 0 };
 
-function renderLoop() {
-    requestAnimationFrame(renderLoop);
-    updateCamera();
-    if (gridMesh.visible) updateGridGeometry();
+// DeviceOrientation (alpha/beta/gamma) → Four.js カメラ回転
+// Three.js DeviceOrientationControls と同じ変換式
+const _q0    = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+const _euler = new THREE.Euler();
+const _qOri  = new THREE.Quaternion();
+
+function applyOrientationToCamera() {
+    _euler.set(
+        THREE.MathUtils.degToRad(devOri.beta),
+        THREE.MathUtils.degToRad(devOri.alpha),
+        THREE.MathUtils.degToRad(-devOri.gamma),
+        'YXZ'
+    );
+    _qOri.setFromEuler(_euler);
+    camera.quaternion.copy(_qOri).multiply(_q0);
+    // 並進は推定できないので初期位置に固定
+    camera.position.set(0, FALLBACK_EYE_H, 0);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   §6  フレームループ
+   ═══════════════════════════════════════════════════════════ */
+
+let isXrMode   = false;
+let xrRefSpace = null;
+
+function onFrame(_timestamp, frame) {
+    let camX = 0, camZ = 0;
+
+    if (isXrMode && frame && xrRefSpace) {
+        // WebXR: ARKit から 6DOF カメラポーズを取得
+        const pose = frame.getViewerPose(xrRefSpace);
+        if (pose) {
+            camX = pose.transform.position.x;
+            camZ = pose.transform.position.z;
+        }
+    } else {
+        // DeviceOrientation: 並進なし (カメラは常に原点)
+        applyOrientationToCamera();
+        camX = 0;
+        camZ = 0;
+    }
+
+    // グリッド平面をカメラ直下に追従させる
+    // ——重要——
+    // mesh は XZ 方向に動くが、シェーダーは vWorldPos.xz (絶対座標) で
+    // 格子を描くため、グリッド線は常に世界座標に固定されて見える。
+    // カメラが前進するとグリッド線が足元を後ろへ流れる動きになる。
+    gridMesh.position.set(camX, 0, camZ);
+
     renderer.render(scene, camera);
 }
 
-/* ── 起動フロー ──────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   §7  起動フロー
+   ═══════════════════════════════════════════════════════════ */
 
 function setStatus(msg) {
     document.getElementById('status').textContent = msg;
 }
 
-async function start() {
-    /* 1. リアカメラ映像取得 */
-    setStatus('カメラを起動中…');
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-                facingMode: 'environment',
-                width:  { ideal: 1920 },
-                height: { ideal: 1080 },
-            },
-            audio: false,
-        });
-        const video = document.getElementById('cam-feed');
-        video.srcObject = stream;
-        video.style.display = 'block';
-    } catch (e) {
-        alert('カメラへのアクセスが拒否されました。\nブラウザの設定でカメラを許可してください。');
-        setStatus('カメラ許可が必要です');
-        return;
-    }
+async function tryWebXR() {
+    if (!navigator.xr) return false;
+    const supported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+    if (!supported) return false;
 
-    /* 2. 傾きセンサー (iOS 13+ は明示的許可が必要) */
-    setStatus('傾きセンサーを初期化中…');
-    try {
-        if (typeof DeviceOrientationEvent !== 'undefined' &&
-            typeof DeviceOrientationEvent.requestPermission === 'function') {
-            // iOS 13+ — ユーザーアクション内でのみ呼び出し可能
-            const perm = await DeviceOrientationEvent.requestPermission();
-            if (perm !== 'granted') throw new Error('denied');
-        }
-        window.addEventListener('deviceorientation', (e) => {
-            if (e.beta  !== null) filteredBeta  = kBeta.update(e.beta);
-            if (e.gamma !== null) filteredGamma = kGamma.update(e.gamma);
-        });
-    } catch (_) {
-        // デスクトップや古い端末: 固定の俯瞰アングルで表示
-        setStatus('傾きセンサー未対応 — 固定視点で表示');
-    }
+    const session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['local-floor'],
+        optionalFeatures: ['hit-test'],
+    });
 
-    /* 3. 床面を固定 (y=0 の水平平面) */
-    fallback.plane = { nx: 0, ny: 1, nz: 0, d: 0 };
+    renderer.xr.setReferenceSpaceType('local-floor');
+    await renderer.xr.setSession(session);
+    xrRefSpace = await session.requestReferenceSpace('local-floor');
 
-    /* 4. UI 切り替え */
-    document.getElementById('btn-start').hidden = true;
-    document.getElementById('ui').classList.add('visible');
-    setStatus('');
+    session.addEventListener('end', () => {
+        xrRefSpace = null;
+        isXrMode   = false;
+        document.getElementById('btn-start').hidden = false;
+        document.getElementById('ui').classList.remove('visible');
+    });
 
-    /* 5. レンダーループ開始 */
-    renderLoop();
+    isXrMode = true;
+    renderer.setAnimationLoop(onFrame);
+    setStatus('ARKit トラッキング中');
+    return true;
 }
 
-document.getElementById('btn-start').addEventListener('click', start);
+async function startDeviceOrientationFallback() {
+    // カメラ映像をビデオ要素に流す (AR 感を出すための背景)
+    const video = document.getElementById('cam-feed');
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'environment', width: { ideal: 1920 } },
+            audio: false,
+        });
+        video.srcObject = stream;
+        video.style.display = 'block';
+    } catch (_) {
+        setStatus('カメラなし — グリッドのみ表示');
+    }
 
-/* ── UI イベント ─────────────────────────────────────────────────────── */
+    // iOS 13+ は明示的な許可が必要 (ユーザーアクション内でのみ有効)
+    try {
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+            if (await DeviceOrientationEvent.requestPermission() !== 'granted') throw 0;
+        }
+        window.addEventListener('deviceorientation', (e) => {
+            if (e.alpha !== null) devOri.alpha = kAlpha.update(e.alpha);
+            if (e.beta  !== null) devOri.beta  = kBeta.update(e.beta);
+            if (e.gamma !== null) devOri.gamma = kGamma.update(e.gamma);
+        });
+        setStatus('ジャイロ モード (並進なし)');
+    } catch (_) {
+        setStatus('固定視点 — 傾きセンサー未許可');
+    }
+
+    renderer.setAnimationLoop(onFrame);
+}
+
+document.getElementById('btn-start').addEventListener('click', async () => {
+    document.getElementById('btn-start').hidden = true;
+    document.getElementById('ui').classList.add('visible');
+
+    const gotXr = await tryWebXR();
+    if (!gotXr) await startDeviceOrientationFallback();
+});
+
+/* ═══════════════════════════════════════════════════════════
+   §8  UI イベント
+   ═══════════════════════════════════════════════════════════ */
 
 const uiState = { spacing: DEFAULT_SPACING };
 
 document.getElementById('slider-spacing').addEventListener('input', (e) => {
     uiState.spacing = parseFloat(e.target.value);
+    // uniform を直接更新するだけ — 頂点バッファ再生成は不要
+    gridUniforms.uSpacing.value = uiState.spacing;
     document.getElementById('label-spacing').textContent =
         `${uiState.spacing.toFixed(2)} m`;
 });
 
 document.getElementById('slider-smoothing').addEventListener('input', (e) => {
-    const r = parseFloat(e.target.value);
-    document.getElementById('label-smoothing').textContent = r.toFixed(2);
-    // R が大きいほど平滑化が強い (計測値を信用しない)
-    kBeta._r  = r * 5;
-    kGamma._r = r * 5;
+    const v = parseFloat(e.target.value);
+    // R が大きいほど計測値を信用しない → 平滑化強
+    kBeta.r = kGamma.r = v * 5 + 0.1;
+    document.getElementById('label-smoothing').textContent = v.toFixed(2);
 });
 
 document.getElementById('color-picker').addEventListener('input', (e) => {
-    gridMat.color.set(e.target.value);
+    gridUniforms.uColor.value.set(e.target.value);
 });
 
 document.getElementById('toggle-grid').addEventListener('change', (e) => {
     gridMesh.visible = e.target.checked;
     document.getElementById('label-toggle').textContent =
         e.target.checked ? '表示' : '非表示';
-    if (!e.target.checked) gridGeo.setDrawRange(0, 0);
 });
